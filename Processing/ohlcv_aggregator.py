@@ -18,6 +18,10 @@ producer_conf = {
 INPUT_TOPIC = "trades.btcusdt"
 OUTPUT_TOPIC = "ohlcv.btcusdt"
 
+WINDOW_SIZE_MS = 60000
+ALLOWED_LATENESS_MS = 10000  # 10 seconds
+
+
 # -------------------------------
 # Initialize Consumer & Producer
 # -------------------------------
@@ -32,14 +36,18 @@ consumer.subscribe([INPUT_TOPIC])
 # -------------------------------
 
 candles = {}
-current_window = None
+max_event_time = 0
 
 # -------------------------------
 # Helper Functions
 # -------------------------------
 
 def get_window_start(timestamp):
-    return (timestamp // 60000) * 60000 # Floor division, to the nearest minute
+    return (timestamp // WINDOW_SIZE_MS) * WINDOW_SIZE_MS # Floor division, to the nearest specified Window
+
+def is_late(window_start):
+    return max_event_time > window_start + WINDOW_SIZE_MS + ALLOWED_LATENESS_MS
+
 
 
 def process_trade(trade):
@@ -50,6 +58,11 @@ def process_trade(trade):
 
     window = get_window_start(trade_time)
     key = (symbol, window) # Symbol is included for scalability reasons, in case we add other crypto-currencies aside from BTC
+
+    # Drop or log late data
+    if is_late(window):
+        print(f"⚠️ Late trade dropped: {trade}")
+        return
 
     if key not in candles: #For the first trade message in a minute window
         candles[key] = {
@@ -69,11 +82,11 @@ def process_trade(trade):
     return window
 
 
-def emit_candles(window_to_emit):
+def emit_candles():
     global candles
 
     for (symbol, window), candle in list(candles.items()):
-        if window == window_to_emit:
+         if is_late(window):
             output = {
                 "symbol": symbol,
                 "interval": "1m",
@@ -82,7 +95,7 @@ def emit_candles(window_to_emit):
                 "high": candle["high"],
                 "low": candle["low"],
                 "close": candle["close"],
-                "volume": candle["volume"]
+                "volume": candle["volume"] # Quantity of BTC
             }
 
             producer.produce(OUTPUT_TOPIC, value=json.dumps(output))
@@ -111,17 +124,25 @@ try:
 
         trade = json.loads(msg.value().decode("utf-8")) #De-serializing into python dictionary
 
-        window = process_trade(trade) # Processes trade msgs into minute candles, returns the minute window
+        # Update max event time (watermark proxy)
+        trade_time = trade["trade_time"]
+        max_event_time = max(max_event_time, trade_time)
 
-        if current_window is None:
-            current_window = window
+        process_trade(trade) # Processes trade msgs into minute candles, returns the minute window
 
-        if window != current_window: # When a minute passes, this will emit the candle then move to the next minute window
-            emit_candles(current_window)
-            current_window = window
+        # Try to emit any completed windows
+        emit_candles()
 
+        # Debug visibility (optional but useful)
+        print(f"""
+                State
+                Max Event Time: {max_event_time}
+                Open Windows: {len(candles)}
+                """)
+        
 except KeyboardInterrupt:
     print("🛑 Stopping aggregator...")
 
 finally:
     consumer.close()
+    producer.flush()
