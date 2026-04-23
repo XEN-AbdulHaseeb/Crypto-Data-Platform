@@ -1,5 +1,6 @@
 from confluent_kafka import Consumer, Producer
 import json
+import redis
 
 # -------------------------------
 # Config
@@ -30,119 +31,148 @@ producer = Producer(producer_conf)
 
 consumer.subscribe([INPUT_TOPIC])
 
-# -------------------------------
-# State
-# -------------------------------
-
-open_candles = {}
-closed_candles = {}
-max_event_time = 0
+r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
 # -------------------------------
-# Helpers
+# Redis Key Helpers
+# -------------------------------
+
+def open_key(symbol, window):
+    return f"open:{symbol}:{window}"
+
+def closed_key(symbol, window):
+    return f"closed:{symbol}:{window}"
+
+def get_max_event_time():
+    val = r.get("meta:max_event_time")
+    return int(val) if val else 0
+
+def update_max_event_time(ts):
+    current = get_max_event_time()
+    if ts > current:
+        r.set("meta:max_event_time", ts)
+
+# -------------------------------
+# Window Logic
 # -------------------------------
 
 def get_window_start(ts):
     return (ts // WINDOW_SIZE_MS) * WINDOW_SIZE_MS
 
-
 def is_window_closed(window):
+    max_event_time = get_max_event_time()
     return max_event_time > window + WINDOW_SIZE_MS + ALLOWED_LATENESS_MS
 
+# -------------------------------
+# Candle Logic
+# -------------------------------
 
-def create_new_candle(price, quantity):
-    return {
-        "open": price,
-        "high": price,
-        "low": price,
-        "close": price,
-        "volume": quantity,
-        "version": 1
-    }
+def create_or_update_open(symbol, window, price, quantity):
+    """
+    NOTE:
+    This function intentionally re-checks key existence even if the caller
+    already performed the same check.
 
+    Rationale:
+    - Defensive programming (safe for future call sites)
+    - Encapsulation of create/update logic
+    - Idempotent behavior for streaming systems
 
-def update_candle(candle, price, quantity):
-    candle["high"] = max(candle["high"], price)
-    candle["low"] = min(candle["low"], price)
-    candle["close"] = price
-    candle["volume"] += quantity
+    Trade-off:
+    - Extra Redis call; may be optimized later.
+    """
 
+    key = open_key(symbol, window)
+
+    if not r.exists(key):
+        r.hset(key, mapping={
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": quantity,
+            "version": 1
+        })
+    else:
+        c = r.hgetall(key)
+
+        high = max(float(c["high"]), price)
+        low = min(float(c["low"]), price)
+        volume = float(c["volume"]) + quantity
+
+        r.hset(key, mapping={
+            "high": high,
+            "low": low,
+            "close": price,
+            "volume": volume
+        })
+
+def handle_late_trade(symbol, window, price, quantity):
+    key = closed_key(symbol, window)
+
+    if r.exists(key):
+        c = r.hgetall(key)
+
+        high = max(float(c["high"]), price)
+        low = min(float(c["low"]), price)
+        volume = float(c["volume"]) + quantity
+        version = int(c["version"]) + 1
+
+        r.hset(key, mapping={
+            "high": high,
+            "low": low,
+            "close": price,
+            "volume": volume,
+            "version": version
+        })
+
+        updated = r.hgetall(key)
+        emit(symbol, window, updated, "correction")
+
+# -------------------------------
+# Emit
+# -------------------------------
 
 def emit(symbol, window, candle, event_type):
     output = {
         "symbol": symbol,
         "interval": "1m",
         "start_time": window,
-        "open": candle["open"],
-        "high": candle["high"],
-        "low": candle["low"],
-        "close": candle["close"],
-        "volume": candle["volume"],
-        "version": candle["version"],
+        "open": float(candle["open"]),
+        "high": float(candle["high"]),
+        "low": float(candle["low"]),
+        "close": float(candle["close"]),
+        "volume": float(candle["volume"]),
+        "version": int(candle["version"]),
         "event_type": event_type
     }
 
     producer.produce(OUTPUT_TOPIC, value=json.dumps(output))
     print(f"{event_type.upper()} EMIT: {output}")
 
-
 # -------------------------------
-# Core Logic
+# Close Windows
 # -------------------------------
-
-def process_trade(trade):
-    symbol = trade["symbol"]
-    price = trade["price"]
-    quantity = trade["quantity"]
-    trade_time = trade["trade_time"]
-
-    window = get_window_start(trade_time)
-    key = (symbol, window)
-
-    # ---------------------------
-    # CASE 1: OPEN WINDOW
-    # ---------------------------
-    if key in open_candles:
-        update_candle(open_candles[key], price, quantity)
-        return
-
-    # ---------------------------
-    # CASE 2: LATE TRADE (CLOSED WINDOW)
-    # ---------------------------
-    if key in closed_candles:
-        candle = closed_candles[key]
-
-        update_candle(candle, price, quantity)
-        candle["version"] += 1
-
-        emit(symbol, window, candle, "correction")
-        return
-
-    # ---------------------------
-    # CASE 3: NEW WINDOW
-    # ---------------------------
-    open_candles[key] = create_new_candle(price, quantity)
-
 
 def close_windows():
-    global open_candles
+    for key in r.scan_iter("open:*"):
+        _, symbol, window = key.split(":")
+        window = int(window)
 
-    for (symbol, window), candle in list(open_candles.items()):
         if is_window_closed(window):
+            candle = r.hgetall(key)
 
             emit(symbol, window, candle, "final")
 
-            closed_candles[(symbol, window)] = candle
-            del open_candles[(symbol, window)]
+            r.rename(key, closed_key(symbol, window))
 
     producer.flush()
-
 
 # -------------------------------
 # Main Loop
 # -------------------------------
 
-print(" OHLCV Aggregator (with corrections) started...")
+print("OHLCV Aggregator (Redis-backed) started...")
 
 try:
     while True:
@@ -157,22 +187,27 @@ try:
 
         trade = json.loads(msg.value().decode("utf-8"))
 
-        trade_time = trade["trade_time"]
+        symbol = trade["symbol"]
+        price = float(trade["price"])
+        quantity = float(trade["quantity"])
+        trade_time = int(trade["trade_time"])
 
-        # Update watermark proxy
-        max_event_time = max(max_event_time, trade_time)
+        window = get_window_start(trade_time)
 
-        process_trade(trade)
+        # Update watermark
+        update_max_event_time(trade_time)
+
+        # Decide path
+        if r.exists(open_key(symbol, window)):
+            create_or_update_open(symbol, window, price, quantity)
+
+        elif r.exists(closed_key(symbol, window)):
+            handle_late_trade(symbol, window, price, quantity)
+
+        else:
+            create_or_update_open(symbol, window, price, quantity)
 
         close_windows()
-
-        # Debug state
-        print(f"""
-📊 STATE
-Max Event Time: {max_event_time}
-Open: {len(open_candles)}
-Closed: {len(closed_candles)}
-""")
 
 except KeyboardInterrupt:
     print("Stopping aggregator...")
