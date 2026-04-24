@@ -1,5 +1,5 @@
 import pytest
-from Processing.ohlcv_aggregator import (
+from processing.ohlcv_aggregator import (
     get_window_start,
     is_window_closed,
     WINDOW_SIZE_MS,
