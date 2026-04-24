@@ -59,9 +59,8 @@ def update_max_event_time(ts):
 def get_window_start(ts):
     return (ts // WINDOW_SIZE_MS) * WINDOW_SIZE_MS
 
-def is_window_closed(window):
-    max_event_time = get_max_event_time()
-    return max_event_time > window + WINDOW_SIZE_MS + ALLOWED_LATENESS_MS
+def is_window_closed(window_start: int, max_event_time: int) -> bool:
+    return max_event_time > window_start + WINDOW_SIZE_MS + ALLOWED_LATENESS_MS
 
 # -------------------------------
 # Candle Logic
@@ -155,11 +154,12 @@ def emit(symbol, window, candle, event_type):
 # -------------------------------
 
 def close_windows():
+    max_event_time = get_max_event_time()
     for key in r.scan_iter("open:*"):
         _, symbol, window = key.split(":")
         window = int(window)
 
-        if is_window_closed(window):
+        if is_window_closed(window, max_event_time):
             candle = r.hgetall(key)
 
             emit(symbol, window, candle, "final")
@@ -192,7 +192,8 @@ try:
         quantity = float(trade["quantity"])
         trade_time = int(trade["trade_time"])
 
-        window = get_window_start(trade_time)
+        window_start = get_window_start(trade_time)
+        window = window_start # For the sake of clarity
 
         # Update watermark
         update_max_event_time(trade_time)
