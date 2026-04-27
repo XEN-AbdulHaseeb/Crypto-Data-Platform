@@ -21,3 +21,6 @@ class BaseProducer:
             callback=self.delivery_report
         )
         self.producer.poll(0)
+
+    def flush(self):
+        self.producer.flush()
